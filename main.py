@@ -10,11 +10,22 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-MODEL_URL = (
+GESTURE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
 )
-MODEL_PATH = Path(__file__).resolve().parent / "gesture_recognizer.task"
+GESTURE_MODEL_PATH = Path(__file__).resolve().parent / "gesture_recognizer.task"
+
+FACE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+FACE_MODEL_PATH = Path(__file__).resolve().parent / "face_landmarker.task"
+
+# Only show a blendshape pill above the face when its confidence clears this
+# threshold. Most blendshapes idle below 0.2 on a resting face; 0.4 keeps the
+# overlay quiet until the user is clearly expressing something.
+FACE_BLENDSHAPE_THRESHOLD = 0.4
 
 # (MCP, PIP, TIP) triplets for index / middle / ring / pinky.
 FINGER_JOINTS = ((5, 6, 8), (9, 10, 12), (13, 14, 16), (17, 18, 20))
@@ -42,12 +53,12 @@ ONE_EURO_D_CUTOFF = 1.0
 GESTURE_DEBOUNCE = 3
 
 
-def ensure_model() -> Path:
-    if not MODEL_PATH.exists():
-        print(f"Downloading gesture recognizer model to {MODEL_PATH} ...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+def ensure_model(url: str, path: Path, label: str) -> Path:
+    if not path.exists():
+        print(f"Downloading {label} model to {path} ...")
+        urllib.request.urlretrieve(url, path)
         print("Done.")
-    return MODEL_PATH
+    return path
 
 
 def _joint_angle(a, b, c) -> float:
@@ -167,6 +178,34 @@ def draw_hand(frame, landmarks) -> None:
         cv2.circle(frame, p, 3, (255, 255, 255), -1, cv2.LINE_AA)
 
 
+# Face mesh palette. Skipping FACE_LANDMARKS_TESSELATION on purpose — the full
+# ~2900-edge mesh reads as visual noise over a webcam feed. Contours + irises
+# give a clean wireframe. Monochrome cyan/grey HUD look: neutral and tech-y
+# rather than makeup-y.
+_FC = vision.FaceLandmarksConnections
+_FACE_OUTLINE_COLOR = (200, 200, 200)   # light grey
+_FACE_FEATURE_COLOR = (220, 200, 140)   # muted cyan-ish
+_FACE_IRIS_COLOR    = (255, 240, 200)   # brighter cyan accent
+_FACE_CONNECTION_GROUPS = (
+    (_FC.FACE_LANDMARKS_FACE_OVAL,     _FACE_OUTLINE_COLOR),
+    (_FC.FACE_LANDMARKS_LIPS,          _FACE_FEATURE_COLOR),
+    (_FC.FACE_LANDMARKS_LEFT_EYE,      _FACE_FEATURE_COLOR),
+    (_FC.FACE_LANDMARKS_LEFT_EYEBROW,  _FACE_FEATURE_COLOR),
+    (_FC.FACE_LANDMARKS_RIGHT_EYE,     _FACE_FEATURE_COLOR),
+    (_FC.FACE_LANDMARKS_RIGHT_EYEBROW, _FACE_FEATURE_COLOR),
+    (_FC.FACE_LANDMARKS_LEFT_IRIS,     _FACE_IRIS_COLOR),
+    (_FC.FACE_LANDMARKS_RIGHT_IRIS,    _FACE_IRIS_COLOR),
+)
+
+
+def draw_face(frame, landmarks) -> None:
+    h, w = frame.shape[:2]
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for conns, color in _FACE_CONNECTION_GROUPS:
+        for conn in conns:
+            cv2.line(frame, pts[conn.start], pts[conn.end], color, 1, cv2.LINE_AA)
+
+
 def _draw_text_pill(frame, text, x, y, font, scale, thickness, fg,
                     alpha: float = 0.55, pad: int = 4) -> None:
     # Darken a rectangular ROI behind the text for legibility, then draw text.
@@ -183,7 +222,12 @@ def _draw_text_pill(frame, text, x, y, font, scale, thickness, fg,
 
 
 def main() -> None:
-    model_path = ensure_model()
+    gesture_model_path = ensure_model(
+        GESTURE_MODEL_URL, GESTURE_MODEL_PATH, "gesture recognizer"
+    )
+    face_model_path = ensure_model(
+        FACE_MODEL_URL, FACE_MODEL_PATH, "face landmarker"
+    )
 
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -204,7 +248,7 @@ def main() -> None:
     # has CPU-only ops that force per-frame CPU<->GPU syncs.
     options = vision.GestureRecognizerOptions(
         base_options=mp_python.BaseOptions(
-            model_asset_path=str(model_path),
+            model_asset_path=str(gesture_model_path),
             delegate=mp_python.BaseOptions.Delegate.CPU,
         ),
         running_mode=vision.RunningMode.VIDEO,
@@ -214,12 +258,30 @@ def main() -> None:
         min_tracking_confidence=0.5,
     )
 
+    # num_faces=1: built-in temporal smoothing of the 478 landmarks only kicks
+    # in at 1, and a single user is enough for this app. Blendshapes give us a
+    # facial-expression label parallel to the hand gesture label.
+    face_options = vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(
+            model_asset_path=str(face_model_path),
+            delegate=mp_python.BaseOptions.Delegate.CPU,
+        ),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=False,
+    )
+
     t0 = time.monotonic()
     last_ts_ms = -1
 
     prev_loop_t: float | None = None
     fps_ema = 0.0
     infer_ms_ema = 0.0
+    face_infer_ms_ema = 0.0
     EMA_ALPHA = 0.1
 
     per_hand_history: dict[str, deque] = {
@@ -235,7 +297,10 @@ def main() -> None:
         "Right": deque(maxlen=GESTURE_DEBOUNCE),
     }
 
-    with vision.GestureRecognizer.create_from_options(options) as recognizer:
+    with (
+        vision.GestureRecognizer.create_from_options(options) as recognizer,
+        vision.FaceLandmarker.create_from_options(face_options) as face_landmarker,
+    ):
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -258,6 +323,14 @@ def main() -> None:
             infer_ms_ema = (
                 infer_ms if infer_ms_ema == 0.0
                 else (1 - EMA_ALPHA) * infer_ms_ema + EMA_ALPHA * infer_ms
+            )
+
+            t_pre_face = time.monotonic()
+            face_result = face_landmarker.detect_for_video(mp_image, ts_ms)
+            face_infer_ms = (time.monotonic() - t_pre_face) * 1000.0
+            face_infer_ms_ema = (
+                face_infer_ms if face_infer_ms_ema == 0.0
+                else (1 - EMA_ALPHA) * face_infer_ms_ema + EMA_ALPHA * face_infer_ms
             )
 
             t_now = ts_ms / 1000.0
@@ -324,15 +397,47 @@ def main() -> None:
                     _draw_text_pill(frame, text, x, y, font, scale, thickness, color)
                     y += th + 8
 
+            # Faces. With num_faces=1 we draw at most one mesh; if blendshapes
+            # are enabled the result also carries a per-face expression list.
+            face_blendshapes = face_result.face_blendshapes
+            for i, face_lms in enumerate(face_result.face_landmarks):
+                draw_face(frame, face_lms)
+
+                if not face_blendshapes or i >= len(face_blendshapes):
+                    continue
+                face_bs = face_blendshapes[i]
+                # _neutral is almost always the top score on a resting face;
+                # drop it so the overlay reflects the actual expression.
+                ranked = sorted(
+                    (c for c in face_bs if c.category_name != "_neutral"),
+                    key=lambda c: c.score,
+                    reverse=True,
+                )
+                if ranked and ranked[0].score >= FACE_BLENDSHAPE_THRESHOLD:
+                    top = ranked[0]
+                    label = f"{top.category_name} {top.score * 100:.0f}%"
+                    fh, fw = frame.shape[:2]
+                    forehead = face_lms[10]  # top of the face oval
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    scale = 0.55
+                    thickness = 1
+                    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+                    fx = max(5, min(int(forehead.x * fw) - tw // 2, fw - tw - 5))
+                    fy = max(th + 5, int(forehead.y * fh) - 12)
+                    _draw_text_pill(frame, label, fx, fy, font, scale, thickness,
+                                    _FACE_IRIS_COLOR)  # matches the mesh palette
+
             # FPS overlay, right-aligned to the top edge.
             h, w = frame.shape[:2]
             font = cv2.FONT_HERSHEY_SIMPLEX
             scale = 0.45
             thickness = 1
             margin = 8
-            for i, text in enumerate(
-                (f"FPS:   {fps_ema:5.1f}", f"Infer: {infer_ms_ema:5.1f} ms")
-            ):
+            for i, text in enumerate((
+                f"FPS:   {fps_ema:5.1f}",
+                f"Infer: {infer_ms_ema:5.1f} ms",
+                f"Face:  {face_infer_ms_ema:5.1f} ms",
+            )):
                 (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
                 y = margin + th + i * (th + 6)
                 _draw_text_pill(frame, text, w - tw - margin, y,
