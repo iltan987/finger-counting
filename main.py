@@ -27,6 +27,16 @@ THUMB_ANGLE_THRESHOLD = 150.0  # thumb is anatomically less straight
 # Majority-vote window for displayed counts (kills flicker on borderline poses).
 SMOOTHING_WINDOW = 5
 
+# One-Euro filter tunings for landmark coords (normalized [0,1] @ ~30 FPS).
+# Higher beta -> snappier on fast motion; lower min_cutoff -> more smoothing
+# when the hand is still. Defaults follow MediaPipe's JS hand-tracking demo.
+ONE_EURO_MIN_CUTOFF = 1.5
+ONE_EURO_BETA = 0.05
+ONE_EURO_D_CUTOFF = 1.0
+
+# Require this many consecutive identical detections before showing a gesture.
+GESTURE_DEBOUNCE = 3
+
 
 def ensure_model() -> Path:
     if not MODEL_PATH.exists():
@@ -53,6 +63,70 @@ def _mode(values) -> int:
     if not values:
         return 0
     return Counter(values).most_common(1)[0][0]
+
+
+class _OneEuro:
+    # https://gery.casiez.net/1euro/ — adaptive low-pass filter.
+    __slots__ = ("min_cutoff", "beta", "d_cutoff", "x_prev", "dx_prev", "t_prev")
+
+    def __init__(self, min_cutoff: float, beta: float, d_cutoff: float):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev: float | None = None
+        self.dx_prev = 0.0
+        self.t_prev: float | None = None
+
+    @staticmethod
+    def _alpha(cutoff: float, dt: float) -> float:
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x: float, t: float) -> float:
+        if self.t_prev is None:
+            self.t_prev = t
+            self.x_prev = x
+            return x
+        dt = t - self.t_prev
+        if dt <= 0:
+            return self.x_prev  # type: ignore[return-value]
+        dx = (x - self.x_prev) / dt  # type: ignore[operator]
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_s = a_d * dx + (1 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * abs(dx_s)
+        a = self._alpha(cutoff, dt)
+        x_f = a * x + (1 - a) * self.x_prev  # type: ignore[operator]
+        self.x_prev = x_f
+        self.dx_prev = dx_s
+        self.t_prev = t
+        return x_f
+
+
+class _SmoothedLandmark:
+    __slots__ = ("x", "y", "z")
+
+    def __init__(self, x: float, y: float, z: float):
+        self.x = x
+        self.y = y
+        self.z = z
+
+
+class HandSmoother:
+    def __init__(self):
+        self._fx = [_OneEuro(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+                    for _ in range(21)]
+        self._fy = [_OneEuro(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+                    for _ in range(21)]
+        self._fz = [_OneEuro(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+                    for _ in range(21)]
+
+    def smooth(self, landmarks, t: float) -> list:
+        return [
+            _SmoothedLandmark(self._fx[i](lm.x, t),
+                              self._fy[i](lm.y, t),
+                              self._fz[i](lm.z, t))
+            for i, lm in enumerate(landmarks)
+        ]
 
 
 def count_fingers(landmarks) -> int:
@@ -102,7 +176,7 @@ def main() -> None:
         ),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
-        min_hand_detection_confidence=0.7,
+        min_hand_detection_confidence=0.5,
         min_hand_presence_confidence=0.5,
         min_tracking_confidence=0.5,
     )
@@ -118,6 +192,14 @@ def main() -> None:
     per_hand_history: dict[str, deque] = {
         "Left": deque(maxlen=SMOOTHING_WINDOW),
         "Right": deque(maxlen=SMOOTHING_WINDOW),
+    }
+    smoothers: dict[str, HandSmoother] = {
+        "Left": HandSmoother(),
+        "Right": HandSmoother(),
+    }
+    gesture_history: dict[str, deque] = {
+        "Left": deque(maxlen=GESTURE_DEBOUNCE),
+        "Right": deque(maxlen=GESTURE_DEBOUNCE),
     }
 
     with vision.GestureRecognizer.create_from_options(options) as recognizer:
@@ -145,32 +227,53 @@ def main() -> None:
                 else (1 - EMA_ALPHA) * infer_ms_ema + EMA_ALPHA * infer_ms
             )
 
+            t_now = ts_ms / 1000.0
             for hand_lms, hand_cats, gest_cats in zip(
                 result.hand_landmarks, result.handedness, result.gestures
             ):
-                draw_hand(frame, hand_lms)
-
-                n = count_fingers(hand_lms)
-
                 # MediaPipe's handedness label refers to the (flipped) image,
                 # so it's the opposite of the user's actual hand — swap it.
-                lines: list[str] = []
+                label = None
+                cat = None
                 if hand_cats:
                     cat = hand_cats[0]
                     label = "Left" if cat.category_name == "Right" else "Right"
+
+                # Smooth landmarks per hand identity. Filters are kept across
+                # frames so the smoother learns each hand's motion profile.
+                if label is not None:
+                    lms = smoothers[label].smooth(hand_lms, t_now)
+                else:
+                    lms = hand_lms
+
+                draw_hand(frame, lms)
+                n = count_fingers(lms)
+
+                lines: list[str] = []
+                if label is not None and cat is not None:
                     per_hand_history[label].append(n)
                     n_smooth = _mode(per_hand_history[label])
                     lines.append(f"{label} {cat.score * 100:.0f}%  -  {n_smooth}")
                 else:
                     lines.append(f"fingers: {n}")
 
-                if gest_cats:
-                    g = gest_cats[0]
-                    if g.category_name and g.category_name != "None":
-                        lines.append(f"{g.category_name} {g.score * 100:.0f}%")
+                # Gesture debounce: only show after N consecutive matching
+                # detections (keyed by the user-perspective hand).
+                if label is not None:
+                    name = ""
+                    score = 0.0
+                    if gest_cats:
+                        g = gest_cats[0]
+                        if g.category_name and g.category_name != "None":
+                            name = g.category_name
+                            score = g.score
+                    history = gesture_history[label]
+                    history.append(name)
+                    if len(history) == GESTURE_DEBOUNCE and name and all(h == name for h in history):
+                        lines.append(f"{name} {score * 100:.0f}%")
 
                 h, w = frame.shape[:2]
-                wrist = hand_lms[0]
+                wrist = lms[0]
                 wx = int(wrist.x * w)
                 wy = int(wrist.y * h)
                 font = cv2.FONT_HERSHEY_SIMPLEX
