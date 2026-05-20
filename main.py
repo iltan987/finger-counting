@@ -106,7 +106,6 @@ def main() -> None:
     infer_ms_ema = 0.0
     EMA_ALPHA = 0.1
 
-    total_history: deque = deque(maxlen=SMOOTHING_WINDOW)
     per_hand_history: dict[str, deque] = {
         "Left": deque(maxlen=SMOOTHING_WINDOW),
         "Right": deque(maxlen=SMOOTHING_WINDOW),
@@ -137,67 +136,58 @@ def main() -> None:
                 else (1 - EMA_ALPHA) * infer_ms_ema + EMA_ALPHA * infer_ms
             )
 
-            total = 0
             for hand_lms, hand_cats, gest_cats in zip(
                 result.hand_landmarks, result.handedness, result.gestures
             ):
                 draw_hand(frame, hand_lms)
 
                 n = count_fingers(hand_lms)
-                total += n
 
                 # MediaPipe's handedness label refers to the (flipped) image,
                 # so it's the opposite of the user's actual hand — swap it.
+                lines: list[str] = []
                 if hand_cats:
                     cat = hand_cats[0]
                     label = "Left" if cat.category_name == "Right" else "Right"
                     per_hand_history[label].append(n)
                     n_smooth = _mode(per_hand_history[label])
-                    info = f"{label} {cat.score * 100:.0f}%  fingers: {n_smooth}"
+                    lines.append(f"{label} {cat.score * 100:.0f}%  -  {n_smooth}")
                 else:
-                    info = f"fingers: {n}"
+                    lines.append(f"fingers: {n}")
 
                 if gest_cats:
                     g = gest_cats[0]
                     if g.category_name and g.category_name != "None":
-                        info += f"  {g.category_name} {g.score * 100:.0f}%"
+                        lines.append(f"{g.category_name} {g.score * 100:.0f}%")
 
                 h, w = frame.shape[:2]
                 wrist = hand_lms[0]
-                x = int(wrist.x * w)
-                y = int(wrist.y * h) + 30
-                cv2.putText(
-                    frame,
-                    info,
-                    (x, y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
+                wx = int(wrist.x * w)
+                wy = int(wrist.y * h)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = 0.6
+                thickness = 2
+                y = wy + 25
+                for line in lines:
+                    (tw, th), _ = cv2.getTextSize(line, font, scale, thickness)
+                    x = max(5, min(wx, w - tw - 5))
+                    cv2.putText(frame, line, (x, y), font, scale,
+                                (0, 255, 0), thickness, cv2.LINE_AA)
+                    y += th + 8
 
-            total_history.append(total)
-            total_smooth = _mode(total_history)
-            cv2.putText(
-                frame,
-                f"Total: {total_smooth}",
-                (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.6,
-                (0, 255, 255),
-                3,
-                cv2.LINE_AA,
-            )
-
-            # FPS overlay (top-right). Compute before imshow so this frame
-            # reflects the latency we just measured.
+            # FPS overlay, right-aligned to the top edge.
             h, w = frame.shape[:2]
-            x = w - 200
-            cv2.putText(frame, f"FPS:   {fps_ema:5.1f}", (x, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2, cv2.LINE_AA)
-            cv2.putText(frame, f"Infer: {infer_ms_ema:5.1f} ms", (x, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2, cv2.LINE_AA)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.45
+            thickness = 1
+            margin = 8
+            for i, text in enumerate(
+                (f"FPS:   {fps_ema:5.1f}", f"Infer: {infer_ms_ema:5.1f} ms")
+            ):
+                (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+                y = margin + th + i * (th + 6)
+                cv2.putText(frame, text, (w - tw - margin, y), font, scale,
+                            (200, 200, 200), thickness, cv2.LINE_AA)
 
             cv2.imshow("Finger Counting", frame)
             key = cv2.waitKey(1) & 0xFF
