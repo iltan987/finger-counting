@@ -17,12 +17,15 @@ MODEL_PATH = Path(__file__).resolve().parent / "gesture_recognizer.task"
 
 # (MCP, PIP, TIP) triplets for index / middle / ring / pinky.
 FINGER_JOINTS = ((5, 6, 8), (9, 10, 12), (13, 14, 16), (17, 18, 20))
-# (MCP, IP, TIP) for the thumb.
-THUMB_JOINTS = (2, 3, 4)
+# (CMC, MCP, TIP) for the thumb. The IP joint barely bends — when the
+# thumb tucks across the palm (e.g. Victory, Closed_Fist) it pivots at
+# CMC/MCP, not IP, so the angle at MCP discriminates extended-vs-tucked
+# far better than the angle at IP.
+THUMB_JOINTS = (1, 2, 4)
 
 # A finger is "extended" when the angle at its middle joint is close to 180°.
 FINGER_ANGLE_THRESHOLD = 160.0
-THUMB_ANGLE_THRESHOLD = 150.0  # thumb is anatomically less straight
+THUMB_ANGLE_THRESHOLD = 150.0
 
 # Majority-vote window for displayed counts (kills flicker on borderline poses).
 SMOOTHING_WINDOW = 5
