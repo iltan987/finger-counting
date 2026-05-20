@@ -6,6 +6,7 @@ from pathlib import Path
 
 import cv2
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
@@ -143,13 +144,42 @@ def count_fingers(landmarks) -> int:
     return count
 
 
+# Per-finger colors (BGR). Palm gets a neutral grey; fingers get distinct hues
+# so the skeleton reads at a glance.
+_HC = vision.HandLandmarksConnections
+_HAND_CONNECTION_GROUPS = (
+    (_HC.HAND_PALM_CONNECTIONS,         (210, 210, 210)),
+    (_HC.HAND_THUMB_CONNECTIONS,        ( 60, 180, 255)),  # orange
+    (_HC.HAND_INDEX_FINGER_CONNECTIONS, ( 80, 255,  80)),  # green
+    (_HC.HAND_MIDDLE_FINGER_CONNECTIONS,(255, 220,  80)),  # cyan
+    (_HC.HAND_RING_FINGER_CONNECTIONS,  (255, 120,  80)),  # blue
+    (_HC.HAND_PINKY_FINGER_CONNECTIONS, (220,  80, 255)),  # magenta
+)
+
+
 def draw_hand(frame, landmarks) -> None:
     h, w = frame.shape[:2]
     pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
-    for conn in vision.HandLandmarksConnections.HAND_CONNECTIONS:
-        cv2.line(frame, pts[conn.start], pts[conn.end], (0, 255, 0), 2, cv2.LINE_AA)
+    for conns, color in _HAND_CONNECTION_GROUPS:
+        for conn in conns:
+            cv2.line(frame, pts[conn.start], pts[conn.end], color, 2, cv2.LINE_AA)
     for p in pts:
-        cv2.circle(frame, p, 4, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, p, 3, (255, 255, 255), -1, cv2.LINE_AA)
+
+
+def _draw_text_pill(frame, text, x, y, font, scale, thickness, fg,
+                    alpha: float = 0.55, pad: int = 4) -> None:
+    # Darken a rectangular ROI behind the text for legibility, then draw text.
+    (tw, th), bl = cv2.getTextSize(text, font, scale, thickness)
+    fh, fw = frame.shape[:2]
+    x0 = max(0, x - pad)
+    y0 = max(0, y - th - pad)
+    x1 = min(fw, x + tw + pad)
+    y1 = min(fh, y + bl + pad)
+    if x1 > x0 and y1 > y0:
+        roi = frame[y0:y1, x0:x1]
+        roi[:] = (roi.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+    cv2.putText(frame, text, (x, y), font, scale, fg, thickness, cv2.LINE_AA)
 
 
 def main() -> None:
@@ -252,13 +282,18 @@ def main() -> None:
                 draw_hand(frame, lms)
                 n = count_fingers(lms)
 
-                lines: list[str] = []
+                # Each entry is (text, fg color). White for stats, gold for
+                # a confirmed gesture.
+                lines: list[tuple[str, tuple[int, int, int]]] = []
                 if label is not None and cat is not None:
                     per_hand_history[label].append(n)
                     n_smooth = _mode(per_hand_history[label])
-                    lines.append(f"{label} {cat.score * 100:.0f}%  -  {n_smooth}")
+                    lines.append(
+                        (f"{label} {cat.score * 100:.0f}%  -  {n_smooth}",
+                         (255, 255, 255))
+                    )
                 else:
-                    lines.append(f"fingers: {n}")
+                    lines.append((f"fingers: {n}", (255, 255, 255)))
 
                 # Gesture debounce: only show after N consecutive matching
                 # detections (keyed by the user-perspective hand).
@@ -273,7 +308,7 @@ def main() -> None:
                     history = gesture_history[label]
                     history.append(name)
                     if len(history) == GESTURE_DEBOUNCE and name and all(h == name for h in history):
-                        lines.append(f"{name} {score * 100:.0f}%")
+                        lines.append((f"{name} {score * 100:.0f}%", (80, 215, 255)))
 
                 h, w = frame.shape[:2]
                 wrist = lms[0]
@@ -283,11 +318,10 @@ def main() -> None:
                 scale = 0.6
                 thickness = 2
                 y = wy + 25
-                for line in lines:
-                    (tw, th), _ = cv2.getTextSize(line, font, scale, thickness)
+                for text, color in lines:
+                    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
                     x = max(5, min(wx, w - tw - 5))
-                    cv2.putText(frame, line, (x, y), font, scale,
-                                (0, 255, 0), thickness, cv2.LINE_AA)
+                    _draw_text_pill(frame, text, x, y, font, scale, thickness, color)
                     y += th + 8
 
             # FPS overlay, right-aligned to the top edge.
@@ -301,8 +335,8 @@ def main() -> None:
             ):
                 (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
                 y = margin + th + i * (th + 6)
-                cv2.putText(frame, text, (w - tw - margin, y), font, scale,
-                            (200, 200, 200), thickness, cv2.LINE_AA)
+                _draw_text_pill(frame, text, w - tw - margin, y,
+                                font, scale, thickness, (220, 220, 220))
 
             cv2.imshow("Finger Counting", frame)
             key = cv2.waitKey(1) & 0xFF
