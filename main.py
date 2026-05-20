@@ -11,9 +11,9 @@ from mediapipe.tasks.python import vision
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
-    "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    "gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
 )
-MODEL_PATH = Path(__file__).resolve().parent / "hand_landmarker.task"
+MODEL_PATH = Path(__file__).resolve().parent / "gesture_recognizer.task"
 
 # (MCP, PIP, TIP) triplets for index / middle / ring / pinky.
 FINGER_JOINTS = ((5, 6, 8), (9, 10, 12), (13, 14, 16), (17, 18, 20))
@@ -30,7 +30,7 @@ SMOOTHING_WINDOW = 5
 
 def ensure_model() -> Path:
     if not MODEL_PATH.exists():
-        print(f"Downloading hand landmarker model to {MODEL_PATH} ...")
+        print(f"Downloading gesture recognizer model to {MODEL_PATH} ...")
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("Done.")
     return MODEL_PATH
@@ -89,7 +89,7 @@ def main() -> None:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
-    options = vision.HandLandmarkerOptions(
+    options = vision.GestureRecognizerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
@@ -112,7 +112,7 @@ def main() -> None:
         "Right": deque(maxlen=SMOOTHING_WINDOW),
     }
 
-    with vision.HandLandmarker.create_from_options(options) as landmarker:
+    with vision.GestureRecognizer.create_from_options(options) as recognizer:
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -130,7 +130,7 @@ def main() -> None:
             last_ts_ms = ts_ms
 
             t_pre = time.monotonic()
-            result = landmarker.detect_for_video(mp_image, ts_ms)
+            result = recognizer.recognize_for_video(mp_image, ts_ms)
             infer_ms = (time.monotonic() - t_pre) * 1000.0
             infer_ms_ema = (
                 infer_ms if infer_ms_ema == 0.0
@@ -138,7 +138,9 @@ def main() -> None:
             )
 
             total = 0
-            for hand_lms, hand_cats in zip(result.hand_landmarks, result.handedness):
+            for hand_lms, hand_cats, gest_cats in zip(
+                result.hand_landmarks, result.handedness, result.gestures
+            ):
                 draw_hand(frame, hand_lms)
 
                 n = count_fingers(hand_lms)
@@ -154,6 +156,11 @@ def main() -> None:
                     info = f"{label} {cat.score * 100:.0f}%  fingers: {n_smooth}"
                 else:
                     info = f"fingers: {n}"
+
+                if gest_cats:
+                    g = gest_cats[0]
+                    if g.category_name and g.category_name != "None":
+                        info += f"  {g.category_name} {g.score * 100:.0f}%"
 
                 h, w = frame.shape[:2]
                 wrist = hand_lms[0]
