@@ -1,3 +1,4 @@
+import argparse
 import math
 import time
 import urllib.request
@@ -54,6 +55,12 @@ ONE_EURO_D_CUTOFF = 1.0
 
 # Require this many consecutive identical detections before showing a gesture.
 GESTURE_DEBOUNCE = 3
+
+# Camera capture defaults. Override on the CLI (see `--help`).
+DEFAULT_CAMERA_INDEX = 0
+DEFAULT_FRAME_WIDTH = 640
+DEFAULT_FRAME_HEIGHT = 480
+DEFAULT_TARGET_FPS = 30
 
 # EMA factor used by the FPS / inference-latency overlays.
 _EMA_ALPHA = 0.1
@@ -323,7 +330,24 @@ def _draw_perf_overlay(frame, fps: float, infer_ms: float, face_infer_ms: float)
                         _PERF_TEXT_COLOR)
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Real-time webcam mirror with hand + face landmarks.",
+    )
+    p.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX,
+                   help=f"Camera index (default: {DEFAULT_CAMERA_INDEX})")
+    p.add_argument("--width", type=int, default=DEFAULT_FRAME_WIDTH,
+                   help=f"Capture width (default: {DEFAULT_FRAME_WIDTH})")
+    p.add_argument("--height", type=int, default=DEFAULT_FRAME_HEIGHT,
+                   help=f"Capture height (default: {DEFAULT_FRAME_HEIGHT})")
+    p.add_argument("--fps", type=int, default=DEFAULT_TARGET_FPS,
+                   help=f"Target capture FPS (default: {DEFAULT_TARGET_FPS})")
+    return p.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
+
     gesture_model_path = ensure_model(
         GESTURE_MODEL_URL, GESTURE_MODEL_PATH, "gesture recognizer"
     )
@@ -331,23 +355,24 @@ def main() -> None:
         FACE_MODEL_URL, FACE_MODEL_PATH, "face landmarker"
     )
 
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+    # cv2.CAP_ANY lets OpenCV pick the right backend per platform:
+    # V4L2 on Linux, DSHOW/MSMF on Windows, AVFOUNDATION on macOS.
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_ANY)
     if not cap.isOpened():
-        print("Could not open webcam.")
+        print(f"Could not open camera index {args.camera}.")
         return
-    # Force MJPEG: raw YUYV at 640x480x30fps is ~221 Mbps and saturates
-    # usbipd's TCP transport (causes V4L2 select() timeouts on WSL2).
+    # MJPG over raw formats: a typical webcam streams 640x480x30fps as
+    # ~220 Mbps in YUYV vs. ~10-30 Mbps in MJPG. The smaller pipe helps
+    # everywhere (USB hubs, virtual USB passthroughs like WSL2/usbipd, etc.)
+    # at no perceptible quality loss for landmark detection.
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
 
-    # Staying on CPU + XNNPACK. The MediaPipe GPU delegate works on WSL2
-    # once Mesa is pointed at the d3d12 driver (env vars
-    # `GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` give
-    # us hardware OpenGL ES on the discrete GPU), but for this model the
-    # GPU and CPU paths benchmark within 0.2 ms of each other — the graph
-    # has CPU-only ops that force per-frame CPU<->GPU syncs.
+    # CPU + XNNPACK. The MediaPipe GPU delegate is available, but for models
+    # this small the graph has CPU-only ops that force per-frame syncs, so
+    # CPU and GPU benchmark within ~0.2 ms of each other on most setups.
     options = vision.GestureRecognizerOptions(
         base_options=mp_python.BaseOptions(
             model_asset_path=str(gesture_model_path),
