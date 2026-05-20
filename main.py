@@ -43,10 +43,13 @@ THUMB_ANGLE_THRESHOLD = 150.0
 SMOOTHING_WINDOW = 5
 
 # One-Euro filter tunings for landmark coords (normalized [0,1] @ ~30 FPS).
-# Higher beta -> snappier on fast motion; lower min_cutoff -> more smoothing
-# when the hand is still. Defaults follow MediaPipe's JS hand-tracking demo.
-ONE_EURO_MIN_CUTOFF = 1.5
-ONE_EURO_BETA = 0.05
+# Higher beta -> snappier on fast motion; higher min_cutoff -> less smoothing
+# when the hand is still. The previous (1.5 / 0.05) settings produced a
+# perceptible lag — the mesh "chased" the real hand. (2.5 / 0.12) trades a
+# little resting-state quiver for near-real-time tracking while still killing
+# the high-frequency landmark jitter that the raw model emits.
+ONE_EURO_MIN_CUTOFF = 2.5
+ONE_EURO_BETA = 0.12
 ONE_EURO_D_CUTOFF = 1.0
 
 # Require this many consecutive identical detections before showing a gesture.
