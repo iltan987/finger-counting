@@ -390,12 +390,24 @@ def main() -> None:
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 scale = 0.6
                 thickness = 2
-                y = wy + 25
-                for text, color in lines:
-                    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+                line_spacing = 8
+                pad = 4  # must match _draw_text_pill default
+                sizes = [cv2.getTextSize(t, font, scale, thickness) for t, _ in lines]
+                # Distance from the first baseline to the last baseline if we
+                # stack downward — matches the previous `y += th + spacing` loop.
+                baseline_span = sum(s[0][1] for s in sizes[:-1]) + line_spacing * (len(sizes) - 1)
+                first_y = wy + 25
+                last_pill_bottom = first_y + baseline_span + sizes[-1][1] + pad
+                if last_pill_bottom > h - 5:
+                    # Flip above the wrist; clamp the top so the first pill
+                    # doesn't bleed off the top edge either.
+                    first_y = max(sizes[0][0][1] + pad + 5,
+                                  wy - 25 - baseline_span)
+                y = first_y
+                for (text, color), ((tw, th), _) in zip(lines, sizes):
                     x = max(5, min(wx, w - tw - 5))
                     _draw_text_pill(frame, text, x, y, font, scale, thickness, color)
-                    y += th + 8
+                    y += th + line_spacing
 
             # Faces. With num_faces=1 we draw at most one mesh; if blendshapes
             # are enabled the result also carries a per-face expression list.
