@@ -101,6 +101,11 @@ def main() -> None:
     t0 = time.monotonic()
     last_ts_ms = -1
 
+    prev_loop_t: float | None = None
+    fps_ema = 0.0
+    infer_ms_ema = 0.0
+    EMA_ALPHA = 0.1
+
     total_history: deque = deque(maxlen=SMOOTHING_WINDOW)
     per_hand_history: dict[str, deque] = {
         "Left": deque(maxlen=SMOOTHING_WINDOW),
@@ -124,7 +129,13 @@ def main() -> None:
                 ts_ms = last_ts_ms + 1
             last_ts_ms = ts_ms
 
+            t_pre = time.monotonic()
             result = landmarker.detect_for_video(mp_image, ts_ms)
+            infer_ms = (time.monotonic() - t_pre) * 1000.0
+            infer_ms_ema = (
+                infer_ms if infer_ms_ema == 0.0
+                else (1 - EMA_ALPHA) * infer_ms_ema + EMA_ALPHA * infer_ms
+            )
 
             total = 0
             for hand_lms, hand_cats in zip(result.hand_landmarks, result.handedness):
@@ -172,10 +183,27 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
+            # FPS overlay (top-right). Compute before imshow so this frame
+            # reflects the latency we just measured.
+            h, w = frame.shape[:2]
+            x = w - 200
+            cv2.putText(frame, f"FPS:   {fps_ema:5.1f}", (x, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"Infer: {infer_ms_ema:5.1f} ms", (x, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2, cv2.LINE_AA)
+
             cv2.imshow("Finger Counting", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or key == 27:
                 break
+
+            now = time.monotonic()
+            if prev_loop_t is not None:
+                dt = now - prev_loop_t
+                if dt > 0:
+                    fps = 1.0 / dt
+                    fps_ema = fps if fps_ema == 0.0 else (1 - EMA_ALPHA) * fps_ema + EMA_ALPHA * fps
+            prev_loop_t = now
 
     cap.release()
     cv2.destroyAllWindows()
