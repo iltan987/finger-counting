@@ -89,8 +89,17 @@ def main() -> None:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
+    # Staying on CPU + XNNPACK. The MediaPipe GPU delegate works on WSL2
+    # once Mesa is pointed at the d3d12 driver (env vars
+    # `GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` give
+    # us hardware OpenGL ES on the discrete GPU), but for this model the
+    # GPU and CPU paths benchmark within 0.2 ms of each other — the graph
+    # has CPU-only ops that force per-frame CPU<->GPU syncs.
     options = vision.GestureRecognizerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+        base_options=mp_python.BaseOptions(
+            model_asset_path=str(model_path),
+            delegate=mp_python.BaseOptions.Delegate.CPU,
+        ),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
         min_hand_detection_confidence=0.7,
