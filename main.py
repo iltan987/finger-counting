@@ -1,6 +1,7 @@
 import math
 import time
 import urllib.request
+from collections import Counter, deque
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,9 @@ THUMB_JOINTS = (2, 3, 4)
 FINGER_ANGLE_THRESHOLD = 160.0
 THUMB_ANGLE_THRESHOLD = 150.0  # thumb is anatomically less straight
 
+# Majority-vote window for displayed counts (kills flicker on borderline poses).
+SMOOTHING_WINDOW = 5
+
 
 def ensure_model() -> Path:
     if not MODEL_PATH.exists():
@@ -43,6 +47,12 @@ def _joint_angle(a, b, c) -> float:
     if mag == 0.0:
         return 0.0
     return math.degrees(math.acos(max(-1.0, min(1.0, dot / mag))))
+
+
+def _mode(values) -> int:
+    if not values:
+        return 0
+    return Counter(values).most_common(1)[0][0]
 
 
 def count_fingers(landmarks) -> int:
@@ -91,6 +101,12 @@ def main() -> None:
     t0 = time.monotonic()
     last_ts_ms = -1
 
+    total_history: deque = deque(maxlen=SMOOTHING_WINDOW)
+    per_hand_history: dict[str, deque] = {
+        "Left": deque(maxlen=SMOOTHING_WINDOW),
+        "Right": deque(maxlen=SMOOTHING_WINDOW),
+    }
+
     with vision.HandLandmarker.create_from_options(options) as landmarker:
         while True:
             ok, frame = cap.read()
@@ -122,7 +138,9 @@ def main() -> None:
                 if hand_cats:
                     cat = hand_cats[0]
                     label = "Left" if cat.category_name == "Right" else "Right"
-                    info = f"{label} {cat.score * 100:.0f}%  fingers: {n}"
+                    per_hand_history[label].append(n)
+                    n_smooth = _mode(per_hand_history[label])
+                    info = f"{label} {cat.score * 100:.0f}%  fingers: {n_smooth}"
                 else:
                     info = f"fingers: {n}"
 
@@ -141,9 +159,11 @@ def main() -> None:
                     cv2.LINE_AA,
                 )
 
+            total_history.append(total)
+            total_smooth = _mode(total_history)
             cv2.putText(
                 frame,
-                f"Total: {total}",
+                f"Total: {total_smooth}",
                 (20, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.6,
