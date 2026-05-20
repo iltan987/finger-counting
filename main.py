@@ -52,6 +52,34 @@ ONE_EURO_D_CUTOFF = 1.0
 # Require this many consecutive identical detections before showing a gesture.
 GESTURE_DEBOUNCE = 3
 
+# EMA factor used by the FPS / inference-latency overlays.
+_EMA_ALPHA = 0.1
+
+# Hand-overlay text styling.
+_HAND_TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_HAND_TEXT_SCALE = 0.6
+_HAND_TEXT_THICKNESS = 2
+_HAND_TEXT_LINE_SPACING = 8
+_HAND_TEXT_COLOR = (255, 255, 255)
+_GESTURE_PILL_COLOR = (80, 215, 255)   # warm gold
+_WRIST_TEXT_OFFSET = 25                 # baseline of the first line below/above the wrist
+_PILL_PAD = 4                           # mirrors _draw_text_pill's default
+
+# Face-overlay text styling.
+_FACE_TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_FACE_TEXT_SCALE = 0.55
+_FACE_TEXT_THICKNESS = 1
+
+# Top-right performance overlay.
+_PERF_TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_PERF_TEXT_SCALE = 0.45
+_PERF_TEXT_THICKNESS = 1
+_PERF_TEXT_COLOR = (220, 220, 220)
+_PERF_MARGIN = 8
+
+# Generic edge padding used when clamping overlays inside the frame.
+_SCREEN_MARGIN = 5
+
 
 def ensure_model(url: str, path: Path, label: str) -> Path:
     if not path.exists():
@@ -221,6 +249,77 @@ def _draw_text_pill(frame, text, x, y, font, scale, thickness, fg,
     cv2.putText(frame, text, (x, y), font, scale, fg, thickness, cv2.LINE_AA)
 
 
+def _update_ema(ema: float, value: float) -> float:
+    # Treat 0.0 as "uninitialized" so the first reading seeds the average
+    # instead of bleeding from a zero baseline.
+    if ema == 0.0:
+        return value
+    return (1.0 - _EMA_ALPHA) * ema + _EMA_ALPHA * value
+
+
+def _draw_hand_overlay(frame, lines, wrist_x: int, wrist_y: int) -> None:
+    # Stack pill lines below the wrist; if they'd overflow the bottom edge,
+    # flip to render above instead. The top edge gets a clamp too so a hand
+    # high in the frame doesn't push the flipped stack off-screen.
+    h, w = frame.shape[:2]
+    sizes = [cv2.getTextSize(t, _HAND_TEXT_FONT, _HAND_TEXT_SCALE, _HAND_TEXT_THICKNESS)
+             for t, _ in lines]
+    baseline_span = (sum(s[0][1] for s in sizes[:-1])
+                     + _HAND_TEXT_LINE_SPACING * (len(sizes) - 1))
+    first_y = wrist_y + _WRIST_TEXT_OFFSET
+    last_pill_bottom = first_y + baseline_span + sizes[-1][1] + _PILL_PAD
+    if last_pill_bottom > h - _SCREEN_MARGIN:
+        first_y = max(sizes[0][0][1] + _PILL_PAD + _SCREEN_MARGIN,
+                      wrist_y - _WRIST_TEXT_OFFSET - baseline_span)
+    y = first_y
+    for (text, color), ((tw, th), _) in zip(lines, sizes):
+        x = max(_SCREEN_MARGIN, min(wrist_x, w - tw - _SCREEN_MARGIN))
+        _draw_text_pill(frame, text, x, y,
+                        _HAND_TEXT_FONT, _HAND_TEXT_SCALE, _HAND_TEXT_THICKNESS,
+                        color)
+        y += th + _HAND_TEXT_LINE_SPACING
+
+
+def _draw_face_blendshape(frame, face_lms, face_bs) -> None:
+    # Drop _neutral — it's always the top score on a resting face. The next
+    # winner only shows up when it clears FACE_BLENDSHAPE_THRESHOLD, keeping
+    # the overlay quiet unless the user is actually expressing something.
+    ranked = sorted(
+        (c for c in face_bs if c.category_name != "_neutral"),
+        key=lambda c: c.score,
+        reverse=True,
+    )
+    if not ranked or ranked[0].score < FACE_BLENDSHAPE_THRESHOLD:
+        return
+    top = ranked[0]
+    label = f"{top.category_name} {top.score * 100:.0f}%"
+    h, w = frame.shape[:2]
+    forehead = face_lms[10]  # top of the face oval
+    (tw, th), _ = cv2.getTextSize(label, _FACE_TEXT_FONT, _FACE_TEXT_SCALE,
+                                  _FACE_TEXT_THICKNESS)
+    x = max(_SCREEN_MARGIN,
+            min(int(forehead.x * w) - tw // 2, w - tw - _SCREEN_MARGIN))
+    y = max(th + _SCREEN_MARGIN, int(forehead.y * h) - 12)
+    _draw_text_pill(frame, label, x, y,
+                    _FACE_TEXT_FONT, _FACE_TEXT_SCALE, _FACE_TEXT_THICKNESS,
+                    _FACE_IRIS_COLOR)
+
+
+def _draw_perf_overlay(frame, fps: float, infer_ms: float, face_infer_ms: float) -> None:
+    w = frame.shape[1]
+    for i, text in enumerate((
+        f"FPS:   {fps:5.1f}",
+        f"Infer: {infer_ms:5.1f} ms",
+        f"Face:  {face_infer_ms:5.1f} ms",
+    )):
+        (tw, th), _ = cv2.getTextSize(text, _PERF_TEXT_FONT, _PERF_TEXT_SCALE,
+                                      _PERF_TEXT_THICKNESS)
+        y = _PERF_MARGIN + th + i * (th + 6)
+        _draw_text_pill(frame, text, w - tw - _PERF_MARGIN, y,
+                        _PERF_TEXT_FONT, _PERF_TEXT_SCALE, _PERF_TEXT_THICKNESS,
+                        _PERF_TEXT_COLOR)
+
+
 def main() -> None:
     gesture_model_path = ensure_model(
         GESTURE_MODEL_URL, GESTURE_MODEL_PATH, "gesture recognizer"
@@ -282,7 +381,6 @@ def main() -> None:
     fps_ema = 0.0
     infer_ms_ema = 0.0
     face_infer_ms_ema = 0.0
-    EMA_ALPHA = 0.1
 
     per_hand_history: dict[str, deque] = {
         "Left": deque(maxlen=SMOOTHING_WINDOW),
@@ -319,141 +417,68 @@ def main() -> None:
 
             t_pre = time.monotonic()
             result = recognizer.recognize_for_video(mp_image, ts_ms)
-            infer_ms = (time.monotonic() - t_pre) * 1000.0
-            infer_ms_ema = (
-                infer_ms if infer_ms_ema == 0.0
-                else (1 - EMA_ALPHA) * infer_ms_ema + EMA_ALPHA * infer_ms
-            )
+            infer_ms_ema = _update_ema(infer_ms_ema, (time.monotonic() - t_pre) * 1000.0)
 
             t_pre_face = time.monotonic()
             face_result = face_landmarker.detect_for_video(mp_image, ts_ms)
-            face_infer_ms = (time.monotonic() - t_pre_face) * 1000.0
-            face_infer_ms_ema = (
-                face_infer_ms if face_infer_ms_ema == 0.0
-                else (1 - EMA_ALPHA) * face_infer_ms_ema + EMA_ALPHA * face_infer_ms
+            face_infer_ms_ema = _update_ema(
+                face_infer_ms_ema, (time.monotonic() - t_pre_face) * 1000.0
             )
 
             t_now = ts_ms / 1000.0
+            h, w = frame.shape[:2]
+
             for hand_lms, hand_cats, gest_cats in zip(
                 result.hand_landmarks, result.handedness, result.gestures
             ):
+                if not hand_cats:
+                    # GestureRecognizer always populates handedness when a hand
+                    # passes its detection threshold, so this is essentially
+                    # unreachable — but skipping is cheaper than guessing.
+                    continue
+                cat = hand_cats[0]
                 # MediaPipe's handedness label refers to the (flipped) image,
                 # so it's the opposite of the user's actual hand — swap it.
-                label = None
-                cat = None
-                if hand_cats:
-                    cat = hand_cats[0]
-                    label = "Left" if cat.category_name == "Right" else "Right"
+                label = "Left" if cat.category_name == "Right" else "Right"
 
-                # Smooth landmarks per hand identity. Filters are kept across
-                # frames so the smoother learns each hand's motion profile.
-                if label is not None:
-                    lms = smoothers[label].smooth(hand_lms, t_now)
-                else:
-                    lms = hand_lms
-
+                # Smooth landmarks per hand identity so each hand keeps its own
+                # filter state across frames.
+                lms = smoothers[label].smooth(hand_lms, t_now)
                 draw_hand(frame, lms)
-                n = count_fingers(lms)
 
-                # Each entry is (text, fg color). White for stats, gold for
-                # a confirmed gesture.
-                lines: list[tuple[str, tuple[int, int, int]]] = []
-                if label is not None and cat is not None:
-                    per_hand_history[label].append(n)
-                    n_smooth = _mode(per_hand_history[label])
-                    lines.append(
-                        (f"{label} {cat.score * 100:.0f}%  -  {n_smooth}",
-                         (255, 255, 255))
-                    )
-                else:
-                    lines.append((f"fingers: {n}", (255, 255, 255)))
+                per_hand_history[label].append(count_fingers(lms))
+                n_smooth = _mode(per_hand_history[label])
 
-                # Gesture debounce: only show after N consecutive matching
-                # detections (keyed by the user-perspective hand).
-                if label is not None:
-                    name = ""
-                    score = 0.0
-                    if gest_cats:
-                        g = gest_cats[0]
-                        if g.category_name and g.category_name != "None":
-                            name = g.category_name
-                            score = g.score
-                    history = gesture_history[label]
-                    history.append(name)
-                    if len(history) == GESTURE_DEBOUNCE and name and all(h == name for h in history):
-                        lines.append((f"{name} {score * 100:.0f}%", (80, 215, 255)))
+                lines: list[tuple[str, tuple[int, int, int]]] = [
+                    (f"{label} {n_smooth}  ({cat.score * 100:.0f}%)", _HAND_TEXT_COLOR),
+                ]
 
-                h, w = frame.shape[:2]
+                # Gesture debounce: only show a name after N consecutive
+                # matching detections (keyed by the user-perspective hand).
+                name = ""
+                score = 0.0
+                if gest_cats:
+                    g = gest_cats[0]
+                    if g.category_name and g.category_name != "None":
+                        name = g.category_name
+                        score = g.score
+                history = gesture_history[label]
+                history.append(name)
+                if (len(history) == GESTURE_DEBOUNCE and name
+                        and all(h == name for h in history)):
+                    lines.append((f"{name} {score * 100:.0f}%", _GESTURE_PILL_COLOR))
+
                 wrist = lms[0]
-                wx = int(wrist.x * w)
-                wy = int(wrist.y * h)
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                scale = 0.6
-                thickness = 2
-                line_spacing = 8
-                pad = 4  # must match _draw_text_pill default
-                sizes = [cv2.getTextSize(t, font, scale, thickness) for t, _ in lines]
-                # Distance from the first baseline to the last baseline if we
-                # stack downward — matches the previous `y += th + spacing` loop.
-                baseline_span = sum(s[0][1] for s in sizes[:-1]) + line_spacing * (len(sizes) - 1)
-                first_y = wy + 25
-                last_pill_bottom = first_y + baseline_span + sizes[-1][1] + pad
-                if last_pill_bottom > h - 5:
-                    # Flip above the wrist; clamp the top so the first pill
-                    # doesn't bleed off the top edge either.
-                    first_y = max(sizes[0][0][1] + pad + 5,
-                                  wy - 25 - baseline_span)
-                y = first_y
-                for (text, color), ((tw, th), _) in zip(lines, sizes):
-                    x = max(5, min(wx, w - tw - 5))
-                    _draw_text_pill(frame, text, x, y, font, scale, thickness, color)
-                    y += th + line_spacing
+                _draw_hand_overlay(frame, lines,
+                                   int(wrist.x * w), int(wrist.y * h))
 
-            # Faces. With num_faces=1 we draw at most one mesh; if blendshapes
-            # are enabled the result also carries a per-face expression list.
             face_blendshapes = face_result.face_blendshapes
             for i, face_lms in enumerate(face_result.face_landmarks):
                 draw_face(frame, face_lms)
+                if face_blendshapes and i < len(face_blendshapes):
+                    _draw_face_blendshape(frame, face_lms, face_blendshapes[i])
 
-                if not face_blendshapes or i >= len(face_blendshapes):
-                    continue
-                face_bs = face_blendshapes[i]
-                # _neutral is almost always the top score on a resting face;
-                # drop it so the overlay reflects the actual expression.
-                ranked = sorted(
-                    (c for c in face_bs if c.category_name != "_neutral"),
-                    key=lambda c: c.score,
-                    reverse=True,
-                )
-                if ranked and ranked[0].score >= FACE_BLENDSHAPE_THRESHOLD:
-                    top = ranked[0]
-                    label = f"{top.category_name} {top.score * 100:.0f}%"
-                    fh, fw = frame.shape[:2]
-                    forehead = face_lms[10]  # top of the face oval
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    scale = 0.55
-                    thickness = 1
-                    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
-                    fx = max(5, min(int(forehead.x * fw) - tw // 2, fw - tw - 5))
-                    fy = max(th + 5, int(forehead.y * fh) - 12)
-                    _draw_text_pill(frame, label, fx, fy, font, scale, thickness,
-                                    _FACE_IRIS_COLOR)  # matches the mesh palette
-
-            # FPS overlay, right-aligned to the top edge.
-            h, w = frame.shape[:2]
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            scale = 0.45
-            thickness = 1
-            margin = 8
-            for i, text in enumerate((
-                f"FPS:   {fps_ema:5.1f}",
-                f"Infer: {infer_ms_ema:5.1f} ms",
-                f"Face:  {face_infer_ms_ema:5.1f} ms",
-            )):
-                (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-                y = margin + th + i * (th + 6)
-                _draw_text_pill(frame, text, w - tw - margin, y,
-                                font, scale, thickness, (220, 220, 220))
+            _draw_perf_overlay(frame, fps_ema, infer_ms_ema, face_infer_ms_ema)
 
             cv2.imshow("Finger Counting", frame)
             key = cv2.waitKey(1) & 0xFF
@@ -464,8 +489,7 @@ def main() -> None:
             if prev_loop_t is not None:
                 dt = now - prev_loop_t
                 if dt > 0:
-                    fps = 1.0 / dt
-                    fps_ema = fps if fps_ema == 0.0 else (1 - EMA_ALPHA) * fps_ema + EMA_ALPHA * fps
+                    fps_ema = _update_ema(fps_ema, 1.0 / dt)
             prev_loop_t = now
 
     cap.release()
